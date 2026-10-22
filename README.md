@@ -86,6 +86,15 @@ Suggested before switching the Stop gate to `active`: at least 50 positive and 1
 
 **Stop gate, live in shadow** (Claude Code 2.1.306, Haiku 5.5, 12 ordinary coding turns): 10 stop events, 3 skipped as conditional, 7 judged, all as reports (P(announce) at most 0.03). Jev answered 181-308 ms after the turn had already ended; the hook held the end of the turn for 0-1 ms.
 
+**Stop gate, live in active** (Claude Code 2.1.308, Haiku 5.5, a settings Stop hook that only counts):
+
+| Run | Stop events | Judged | Sent back | Settings Stop hook ran |
+| --- | --- | --- | --- | --- |
+| 12 ordinary coding turns | 6 | 5, all reports (P(announce) at most 0.01) | 0: no false block | 6 of 6 |
+| 3 turns asked to end on an announcement | 2 | 1 ("이제 calc.py의 모든 함수에 docstring을 추가하겠습니다.", 0.99) | 1 | 2 of 2 |
+
+Sent back, the model checked every function with an AST pass, found the docstrings already there and said so; the next stop was skipped as re-entry, with no loop. Ordinary turns never ended on an announcement in these runs, so how often the gate catches a real one is not measured yet; that needs labeled live records. Claude Code shows the gate's message as "Stop hook error: …".
+
 **Tool gate, live** (Claude Code 2.1.306, Haiku 5.5, `providerTrust: external`, `toolGate: active`, a folder of fake secrets):
 
 | Call | Result |
@@ -104,7 +113,7 @@ The guard held each call for 2-4 ms. With the author's global instructions loade
 
 - 0.0.2: Jev for the tool gate, for external sessions only (`choice` open / standard / restricted / custom).
 - 0.0.3: conditional instructions: instruction fragments attached to a turn only when Jev judges them relevant.
-- The Stop gate has not yet run in active mode over a series of live turns.
+- The Stop gate's accuracy on real announcements, from labeled live records.
 
 ## License
 

@@ -82,6 +82,10 @@ Suggested before switching the Stop gate to `active`: at least 50 positive and 1
 - Before conditional endings were excluded, the rule flagged 12.4% of judged turn ends, mostly ones that wait on the person or on running work ("알려주시면 처리하겠습니다", "결과가 나오면 말씀드리겠습니다"). With them excluded: 1,205 skipped (conditional 898, question 297, empty 10), and 91 of the remaining 1,795 (5.1%) flagged.
 - A short nudge from the person right after a turn end ("계속", "go") followed 1.3% of them, mostly API errors and empty turns, and none of the turns the rule flagged. Nudges are not a usable label for this gate; labels have to come from `/jev-mark`.
 
+**The rule against Jev** on 100 of those paragraphs (half flagged by the rule or a nudge), scrubbed and sent with the author's consent: 100 answered, p50 190 ms, p95 342 ms. At 0.7: both 17, rule only 23, Jev only 6, neither 54; kappa 0.35. Read by the author, not labeled: the rule-only cases were mostly endings that wait on approval or a notification ("확인을 받은 뒤에 하겠습니다", "알림이 오는 대로 처리하겠습니다"), which Jev put at 0.33-0.58; the Jev-only cases were mostly present-tense announcements the rule's endings miss ("먼저 … 파일이 어디 있는지 찾습니다.", "step 6으로 넘어갑니다").
+
+**Stop gate, live in shadow** (Claude Code 2.1.306, Haiku 5.5, 12 ordinary coding turns): 10 stop events, 3 skipped as conditional, 7 judged, all as reports (P(announce) at most 0.03). Jev answered 181-308 ms after the turn had already ended; the hook held the end of the turn for 0-1 ms.
+
 **Tool gate, live** (Claude Code 2.1.306, Haiku 5.5, `providerTrust: external`, `toolGate: active`, a folder of fake secrets):
 
 | Call | Result |
@@ -100,7 +104,7 @@ The guard held each call for 2-4 ms. With the author's global instructions loade
 
 - 0.0.2: Jev for the tool gate, for external sessions only (`choice` open / standard / restricted / custom).
 - 0.0.3: conditional instructions: instruction fragments attached to a turn only when Jev judges them relevant.
-- The Stop gate has not yet been measured live against Jev or run in active mode over a series of turns.
+- The Stop gate has not yet run in active mode over a series of live turns.
 
 ## License
 

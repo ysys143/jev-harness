@@ -11,6 +11,8 @@ Judgment gates for Claude Code, built on Jev, TypeSafe's decision model that ans
 | Stop gate | `classic.Stop`, after your own Stop hooks | Catches a turn that ends by announcing work it has not done ("이어서 리팩터링하겠습니다", "Next, I will…") | The turn's last paragraph, scrubbed, to TypeSafe |
 | Tool gate floor (`toolGate`) | `tool.call`, every tool | Finds tool calls that touch secret files or print secrets; refuses them when the session is served by a provider other than Anthropic. Refuses writes to this plugin's files and to Claude settings | Nothing |
 | Tool gate Jev (`toolJev`, 0.0.2) | `tool.call`, external sessions only | Classifies each call the floor let through as open, standard, restricted or custom (Table IV of the Jev notes) from its path or command; refuses restricted and custom | The tool name and the scrubbed path, or the command's first 200 characters |
+| Conditional instructions (`instructions`, 0.0.3) | `prompt.submit`, `prompt.compose` | Appends an instruction fragment to the prompt that first meets its condition, once; pinned fragments go at the end of the system prompt | Your prompt, scrubbed, first 600 characters, and the fragments' conditions (never their bodies) |
+| Fold relevance (`foldJev`, 0.0.3, shadow only) | `session.compact` | Before a compaction, records which large earlier tool results your current request still needs, beside what a size-and-age rule would fold | Your last prompt, scrubbed, and each result's tool and target (never its contents) |
 
 Each is `off`, `shadow` (record what it would do) or `active` (do it), set separately.
 
@@ -37,6 +39,34 @@ The paragraph is scrubbed before it is sent: secret-shaped strings, `NAME=value`
 - What is sent: the tool and its target. A path in the working folder is sent as `./relative`, so the project's name stays home; a path elsewhere under home as `~/<hash>/` plus its last two parts; a system path as is. A command is sent with the working folder as `.`, scrubbed, at most 200 characters. File contents never.
 - Each target is asked once per session. In `shadow` the tool runs first and the judgment is recorded after; in `active` the first call to a target waits for Jev, and restricted plus custom at or above `toolThreshold` (0.8) refuses it. No answer in time lets the call through.
 
+### Conditional instructions (0.0.3)
+
+Claude Code already loads instructions by condition where the condition is a path: `.claude/rules/*.md` with `paths:` and CLAUDE.md files in subfolders load when matching files are touched. Use those for path conditions. These fragments are for conditions a path cannot tell, such as what you are asking for.
+
+A fragment is a Markdown file in `fragmentsDir` (default `~/.agents/fragments`, at most 24, each body at most 4 KB):
+
+```markdown
+---
+when: The person asks for prose meant for human readers, such as a report, an email or documentation.
+keywords: report, email, 보고서
+---
+Lead with the conclusion. One idea per paragraph. Cut filler.
+```
+
+- **Once, at the end.** Claude Code's conversation only grows, and changing anything early in it rewrites the prompt cache. A fragment is therefore appended to the turn whose prompt first meets its condition (as that prompt's added context) and stays in the conversation from then on; it is not judged again until a compaction, which rebuilds the cache anyway. After a compaction every fragment may be judged again.
+- **A keyword decides without Jev.** A prompt that names a fragment's keyword attaches it; otherwise Jev is asked, one request for all fragments not yet attached, and attaches at `instructionThreshold` (0.95). In `shadow` every candidate is asked and nothing is attached.
+- **`pin: true`** puts a fragment, in name order, in one fixed section at the end of the system prompt, in `active` only. The text does not change during a session, so the cached prefix stays.
+- Only prompts you write are judged: not slash commands, meta messages, or messages from other plugins, tasks or peers.
+- Write conditions narrowly. In the measured runs, a broad prose condition also reached 0.92-0.96 on requests like "tell me in one sentence what this file shows". A wrong attach costs only the fragment's tokens, since it stays for the rest of the session either way; a missed one costs the instruction.
+- With the tool gate active, an agent cannot write to the fragments folder. The status line shows the fragments' hash, and a toast says when they changed.
+- `examples/fragments/` has three generic fragments to copy.
+
+### Fold relevance (0.0.3, shadow only)
+
+At a compaction, the prompt cache is rebuilt anyway, so this is where judging what to keep costs no cache. Jev is asked, for up to 48 of the largest earlier tool results (at least 1,000 characters, not already folded), whether your current request still needs it, shown only as its tool, target and size. Each record holds the rule's verdict (context-fold's default policy: two turns old, 1,000 characters, not a state tool, not a short error) and Jev's probability that the output is done with. Nothing changes the compaction.
+
+Hooks run in the order plugins are loaded. A plugin that answers the compaction itself (context-fold) and is loaded before jev-harness takes the compaction before jev-harness sees it; the status line then counts "compactions unseen". Load jev-harness first (`claude --plugin-dir jev-harness --plugin-dir context-fold`, or install it first).
+
 ## Install and enable
 
 ```text
@@ -46,10 +76,10 @@ The paragraph is scrubbed before it is sent: secret-shaped strings, `NAME=value`
 Then turn on the gates you want, in `/config` under jev-harness or in `settings.json`:
 
 ```json
-{ "pluginConfigs": { "jev-harness@jev-harness": { "options": { "stopGate": "shadow", "toolGate": "shadow", "toolJev": "shadow" } } } }
+{ "pluginConfigs": { "jev-harness@jev-harness": { "options": { "stopGate": "shadow", "toolGate": "shadow", "toolJev": "shadow", "instructions": "shadow", "foldJev": "shadow" } } } }
 ```
 
-The Stop gate and the tool gate's Jev need a TypeSafe key, read from the first of: the plugin's `apiKey` setting (kept in secure storage; set it with `/plugin configure jev-harness@jev-harness`), a `TYPESAFE_API_KEY=` line in a `.env` in the plugin's folder, or the `TYPESAFE_API_KEY` environment variable. Without one the status line says `jev: no key` and nothing is sent.
+Everything but the tool gate floor needs a TypeSafe key, read from the first of: the plugin's `apiKey` setting (kept in secure storage; set it with `/plugin configure jev-harness@jev-harness`), a `TYPESAFE_API_KEY=` line in a `.env` in the plugin's folder, or the `TYPESAFE_API_KEY` environment variable. Without one the status line says `jev: no key` and nothing is sent.
 
 ## Records, labels and when to turn a gate on
 
@@ -128,11 +158,28 @@ The guard held each call for 2-4 ms. With the author's global instructions loade
 
 Jev answered in 168-385 ms. In shadow the hook held each call 1-5 ms; in active the first call to each target waited for Jev.
 
-**Tests:** 47 (`claude plugin test`), including a shadow Stop hook returning while its Jev call is still pending, a Jev call that never answers, the cap and the circuit breaker, key precedence, symlinks, and a guard that breaks.
+**Conditional instructions' question** (`jev-1.14.0`, 10 requests x 3 generic conditions): requests that met a condition got 0.99-1.00, the others 0.00-0.78; 28 of 30 right at 0.5, all 30 at 0.9. Asked for 24 conditions at once, Jev answered in 176 ms.
+
+**Conditional instructions, live** (Claude Code 2.1.308, Haiku 5.5, `instructions: active`, the three example fragments, eight prompts with a `/compact` after the fifth):
+
+| Prompt | release | prose |
+| --- | --- | --- |
+| "Read invoice.py and tell me in one sentence what total() does" | 0.00 | 0.92, not attached |
+| "Read server.log and tell me in one sentence what it shows" | 0.00 | 0.96, attached |
+| "Draft a short note for the team…" | 0.00 | not asked: attached |
+| "Explain in three steps how you would put version 1.2 live" | 0.99, attached | not asked |
+| (after `/compact`) "Draft one more short note for the team…" | 0.00 | 1.00, attached again |
+
+The fragments were kept in the transcript as the prompt's added context and sent with every later request. With fragments being attached, each later turn wrote only 56-254 new tokens to the prompt cache and read the rest from it; Jev answered in 192-307 ms before the prompt went on.
+
+**Fold relevance, live** (same run, `foldJev: shadow`, jev-harness loaded before context-fold): at the `/compact`, with "Look for a rounding problem in total()" as the request, the rule would fold both large results; Jev put `./invoice.py` at 0.11 done with and `./server.log` at 0.88. With context-fold loaded first, jev-harness did not see the compaction, as above.
+
+**Tests:** 61 (`claude plugin test`), including a shadow Stop hook returning while its Jev call is still pending, a Jev call that never answers, the cap and the circuit breaker, key precedence, symlinks, and a guard that breaks.
 
 ## Not yet
 
-- 0.0.3: conditional instructions: instruction fragments attached to a turn only when Jev judges them relevant.
+- Fold relevance as a decision rather than a record: handing Jev's judgment to the folding itself.
+- Whether attached fragments make answers better: not measured.
 - The Stop gate's accuracy on real announcements, from labeled live records.
 
 ## License

@@ -1,7 +1,7 @@
 {
   "name": "jev-harness",
-  "version": "0.0.2",
-  "description": "Jev judgment gates for Claude Code: catch turns that end by announcing work, and keep secret or confidential files away from non-Anthropic providers. Off by default; shadow first.",
+  "version": "0.0.3",
+  "description": "Jev judgment gates for Claude Code: catch turns that end by announcing work, keep secret files away from non-Anthropic providers, and attach instruction fragments only when a request needs them. Off by default; shadow first.",
   "author": {
     "name": "ysys143",
     "url": "https://github.com/ysys143"
@@ -95,6 +95,51 @@
       "title": "Trusted local proxies",
       "description": "Comma-separated host:port of local proxies known to forward to Anthropic only (for example 127.0.0.1:9100).",
       "default": ""
+    },
+    "instructions": {
+      "type": "string",
+      "title": "Conditional instructions",
+      "description": "off: nothing. shadow: for each prompt you type, Jev judges which fragments' conditions hold and records it; the prompt (scrubbed, first 600 characters) and the fragments' conditions are sent to TypeSafe, never their bodies. active: matching fragments are appended to that prompt once, and pinned fragments go at the end of the system prompt.",
+      "options": [
+        "off",
+        "shadow",
+        "active"
+      ],
+      "default": "off"
+    },
+    "fragmentsDir": {
+      "type": "string",
+      "title": "Fragments folder",
+      "description": "Folder of *.md fragments with when:, keywords: and pin: frontmatter. ~ means your home folder.",
+      "default": "~/.agents/fragments"
+    },
+    "instructionThreshold": {
+      "type": "number",
+      "title": "Conditional instructions threshold",
+      "description": "Jev's probability that a fragment's condition holds at or above which it is attached.",
+      "default": 0.95
+    },
+    "instructionCap": {
+      "type": "number",
+      "title": "Conditional instructions calls per session",
+      "description": "Jev calls the conditional instructions may make in one session.",
+      "default": 200
+    },
+    "foldJev": {
+      "type": "string",
+      "title": "Fold relevance (shadow only)",
+      "description": "off: nothing. shadow: before each compaction, Jev judges which large earlier tool results the current request still needs, beside what a size-and-age rule would fold, and records it; your last prompt (scrubbed) and each result's tool and target are sent, never the contents.",
+      "options": [
+        "off",
+        "shadow"
+      ],
+      "default": "off"
+    },
+    "foldCap": {
+      "type": "number",
+      "title": "Fold relevance calls per session",
+      "description": "Jev calls the fold judgment may make in one session (24 results per call).",
+      "default": 20
     },
     "apiKey": {
       "type": "string",

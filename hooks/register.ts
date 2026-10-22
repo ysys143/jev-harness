@@ -1,9 +1,23 @@
-import type { Args, EngineInterface, EventResult, Next, Register } from 'claude-code'
+import type { Args, EngineInterface, EventResult, Next, Register, SessionMessage } from 'claude-code'
 import { admit, afterCall, readBudget } from './budget'
 import { JEV_ENDPOINT, parseResponse, probabilityOf, requestBody, type JevQuestion, type JevResult } from './jev'
 import { pickKey } from './key'
 import { pointReport, type ShadowRecord } from './report'
 import { scrub } from './scrub'
+import { FOLD_POINT, currentRequest, foldCandidates, foldQuestion } from './fold-judge'
+import {
+  INSTRUCTIONS_POINT,
+  MAX_FRAGMENTS,
+  conditionQuestion,
+  decideFragments,
+  fragmentBlock,
+  fragmentsHash,
+  isFragment,
+  keywordHit,
+  parseFragment,
+  pinnedSection,
+  type Fragment,
+} from './instructions'
 import { STOP_MESSAGE, STOP_POINT, STOP_QUESTION, announcesByRule, lastParagraph, stopSkipReason } from './stop-gate'
 import {
   TOOL_POINT,
@@ -42,6 +56,12 @@ type Settings = {
   providerTrust: 'auto' | 'external'
   trustedProxies: string[]
   apiKey: unknown
+  instructions: Mode
+  fragmentsDir: string
+  instructionThreshold: number
+  instructionCap: number
+  foldJev: Mode
+  foldCap: number
 }
 
 // Per process: reset on a reload, which only costs a mkdir and a lookup.
@@ -49,10 +69,13 @@ const madeDirs = new Set<string>()
 let sequence = 0
 const runtime: {
   settings?: Settings
-  counts: { judged: number; failed: number; floor: number; toolJudged: number }
+  counts: { judged: number; failed: number; floor: number; toolJudged: number; attached: number; foldJudged: number; foldMissed: number }
+  /** Whether this plugin's session.compact saw the compaction now ending. */
+  sawCompaction?: boolean
   key?: { key: string; source: string } | null
   trust?: { trust: Trust; why: string }
-} = { counts: { judged: 0, failed: 0, floor: 0, toolJudged: 0 } }
+  fragments?: { list: Fragment[]; hash: string; dir: string; problems: string[] }
+} = { counts: { judged: 0, failed: 0, floor: 0, toolJudged: 0, attached: 0, foldJudged: 0, foldMissed: 0 } }
 
 // Tool targets already judged in this process: one Jev call per target and session.
 const toolVerdicts = new Map<string, { risk: number; choice: string }>()
@@ -284,13 +307,161 @@ const trustFor = async ($: EngineInterface): Promise<{ trust: Trust; why: string
 const showStatus = ($: EngineInterface): void => {
   const settings = settingsOf()
   const { counts } = runtime
-  if (settings.stopGate === 'off' && settings.toolGate === 'off' && settings.toolJev === 'off') return
-  if ((settings.stopGate !== 'off' || settings.toolJev !== 'off') && runtime.key === null) return $.ui.status('jev: no key')
+  const usesJev = settings.stopGate !== 'off' || settings.toolJev !== 'off' || settings.instructions !== 'off' || settings.foldJev !== 'off'
+  if (!usesJev && settings.toolGate === 'off') return
+  if (usesJev && runtime.key === null) return $.ui.status('jev: no key')
   const parts = ['jev']
   if (settings.stopGate !== 'off') parts.push(`stop ${settings.stopGate} ${counts.judged} judged${counts.failed ? `, ${counts.failed} failed` : ''}`)
   if (settings.toolGate !== 'off') parts.push(`tool ${settings.toolGate} ${counts.floor} hits`)
   if (settings.toolJev !== 'off') parts.push(`tool jev ${settings.toolJev} ${counts.toolJudged} judged`)
+  if (settings.instructions !== 'off') {
+    const f = runtime.fragments
+    parts.push(`instr ${settings.instructions} ${f ? `${f.list.length} #${f.hash.slice(0, 6)}` : '-'}, ${counts.attached} attached`)
+  }
+  if (settings.foldJev !== 'off') parts.push(`fold ${settings.foldJev} ${counts.foldJudged} judged${counts.foldMissed ? `, ${counts.foldMissed} compactions unseen` : ''}`)
   $.ui.status(parts.join(' · '))
+}
+
+const fragmentsDirOf = async ($: EngineInterface): Promise<string> => {
+  const dir = settingsOf().fragmentsDir.trim()
+  if (dir === '~' || dir.startsWith('~/')) return `${await homeOf($)}${dir.slice(1)}`
+
+  return dir
+}
+
+/** Reads the fragment folder once; a changed set of fragments is announced. */
+const loadFragments = async ($: EngineInterface): Promise<{ list: Fragment[]; hash: string; dir: string; problems: string[] }> => {
+  if (runtime.fragments !== undefined) return runtime.fragments
+  const dir = await fragmentsDirOf($)
+  const list: Fragment[] = []
+  const problems: string[] = []
+  if (dir !== '' && (await $.fs.exists(dir))) {
+    const files = (await $.fs.list(dir)).filter(entry => entry.kind === 'file' && entry.name.endsWith('.md')).map(entry => entry.name).sort()
+    for (const file of files) {
+      if (list.length >= MAX_FRAGMENTS) {
+        problems.push(`${file}: over ${MAX_FRAGMENTS} fragments`)
+        continue
+      }
+      const parsed = parseFragment(file, await $.fs.read(`${dir}/${file}`))
+      if (isFragment(parsed)) list.push(parsed)
+      else problems.push(`${parsed.file}: ${parsed.reason}`)
+    }
+  }
+  const hash = fragmentsHash(list)
+  const seen = await $.store.get('fragments-hash')
+  if (seen !== undefined && seen !== hash) $.ui.toast(`jev-harness: instruction fragments changed (#${hash.slice(0, 6)}, ${list.length} in ${dir})`)
+  await $.store.set('fragments-hash', hash)
+  runtime.fragments = { list, hash, dir, problems }
+
+  return runtime.fragments
+}
+
+const namesIn = async ($: EngineInterface, key: string): Promise<Set<string>> => {
+  const value = await $.store.get(key)
+
+  return new Set(Array.isArray(value) ? value.filter((v): v is string => typeof v === 'string') : [])
+}
+
+/** What a fragment decision is recorded as, one record per fragment. */
+const recordFragments = async (
+  $: EngineInterface,
+  base: { sessionId: string; joinKey?: string; mode: 'shadow' | 'active'; t0: number; hookMs: number },
+  decisions: readonly { name: string; rule: boolean; jev?: number; attach: boolean }[],
+  sent: Record<string, unknown> | null,
+  result: JevResult | undefined,
+): Promise<void> => {
+  for (const decision of decisions) {
+    await writeRecord($, {
+      id: newId(base.t0),
+      ts: new Date(base.t0).toISOString(),
+      sessionId: base.sessionId,
+      joinKey: base.joinKey,
+      point: INSTRUCTIONS_POINT,
+      mode: base.mode,
+      heuristic: decision.rule,
+      sent,
+      jev: decision.jev,
+      usage: result?.ok ? result.usage : undefined,
+      error: result === undefined || result.ok ? undefined : result.kind === 'http' ? `http ${result.status ?? 0}` : result.kind,
+      jevMs: result?.ms,
+      hookMs: base.hookMs,
+      decision: decision.attach ? (base.mode === 'active' ? 'attach' : 'would-attach') : 'skip',
+      facts: { fragment: decision.name },
+    })
+  }
+}
+
+/** Jev's probability that each candidate's condition holds for the prompt, keyed by fragment name. */
+const askConditions = async (
+  $: EngineInterface,
+  sessionId: string,
+  key: string,
+  sent: Record<string, unknown>,
+  candidates: readonly Fragment[],
+): Promise<{ result?: JevResult; probabilities: Map<string, number> }> => {
+  const probabilities = new Map<string, number>()
+  if (candidates.length === 0) return { probabilities }
+  const settings = settingsOf()
+  const questions = Object.fromEntries(candidates.map(fragment => [fragment.name, conditionQuestion(fragment.when)]))
+  const result = await judge($, { sessionId, point: INSTRUCTIONS_POINT, cap: settings.instructionCap }, key, sent, questions, settings.timeoutMs)
+  if (result.ok) {
+    for (const fragment of candidates) {
+      const answer = result.answers[fragment.name]
+      const p = answer === undefined ? undefined : probabilityOf(answer, 'applies')
+      if (p !== undefined) probabilities.set(fragment.name, p)
+    }
+  }
+
+  return { result, probabilities }
+}
+
+/** Forget which fragments were appended: after a compaction they are gone with the old turns. */
+const forgetFragments = async ($: EngineInterface): Promise<void> => {
+  const sessionId = await $.session.id()
+  await $.store.set(`attached:${sessionId}`, [])
+  await $.store.set(`would-attach:${sessionId}`, [])
+}
+
+/** Shadow judgment of fold relevance over the transcript as it stood before compaction. */
+const judgeFold = async ($: EngineInterface, messages: readonly SessionMessage[]): Promise<void> => {
+  const settings = settingsOf()
+  const key = await keyFor($)
+  const request = currentRequest(messages)
+  if (key === undefined || request === undefined) return
+  const home = await homeOf($)
+  const cwd = await $.session.cwd()
+  const sessionId = await $.session.id()
+  const candidates = foldCandidates(messages, home, cwd, 48)
+  const sent = { current_request: scrub(request, home).slice(0, 400) }
+  for (let start = 0; start < candidates.length; start += 24) {
+    const batch = candidates.slice(start, start + 24)
+    const t0 = await $.clock.now()
+    const questions = Object.fromEntries(batch.map((candidate, i) => [`r${i}`, foldQuestion(scrub(candidate.call, home))]))
+    const result = await judge($, { sessionId, point: FOLD_POINT, cap: settings.foldCap }, key.key, sent, questions, settings.timeoutMs * 2)
+    for (const [i, candidate] of batch.entries()) {
+      const answer = result.ok ? result.answers[`r${i}`] : undefined
+      const needed = answer === undefined ? undefined : probabilityOf(answer, 'needed')
+      if (needed !== undefined) runtime.counts.foldJudged++
+      await writeRecord($, {
+        id: newId(t0),
+        ts: new Date(t0).toISOString(),
+        sessionId,
+        joinKey: candidate.id,
+        point: FOLD_POINT,
+        mode: 'shadow',
+        // Positive means "fold": the rule's verdict, and Jev's probability that the output is done with.
+        heuristic: candidate.ruleFolds,
+        sent: { ...sent, call: scrub(candidate.call, home) },
+        jev: needed === undefined ? undefined : 1 - needed,
+        usage: result.ok && i === 0 ? result.usage : undefined,
+        error: result.ok ? undefined : result.kind === 'http' ? `http ${result.status ?? 0}` : result.kind,
+        jevMs: result.ms,
+        hookMs: 0,
+        facts: { tool: candidate.tool, chars: String(candidate.chars), turnsAgo: String(candidate.turnsAgo) },
+      })
+    }
+  }
+  showStatus($)
 }
 
 export const register: Register = (on, options) => {
@@ -309,11 +480,19 @@ export const register: Register = (on, options) => {
         ? options.trustedProxies.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
         : [],
     apiKey: options.apiKey,
+    instructions: modeOf(options.instructions),
+    fragmentsDir: typeof options.fragmentsDir === 'string' && options.fragmentsDir.trim() !== '' ? options.fragmentsDir : '~/.agents/fragments',
+    instructionThreshold: numberOf(options.instructionThreshold, 0.95, 0, 1),
+    instructionCap: numberOf(options.instructionCap, 200, 0, 10_000),
+    foldJev: options.foldJev === 'shadow' ? 'shadow' : 'off',
+    foldCap: numberOf(options.foldCap, 20, 0, 1000),
   }
   runtime.settings = settings
   runtime.key = undefined
   runtime.trust = undefined
-  const isOn = settings.stopGate !== 'off' || settings.toolGate !== 'off' || settings.toolJev !== 'off'
+  runtime.fragments = undefined
+  const isOn =
+    settings.stopGate !== 'off' || settings.toolGate !== 'off' || settings.toolJev !== 'off' || settings.instructions !== 'off' || settings.foldJev !== 'off'
   const { counts } = runtime
 
   on('session.start', async ($, e, next) => {
@@ -325,6 +504,7 @@ export const register: Register = (on, options) => {
       await $.process.run(['find', root, '-type', 'f', '-mtime', '+14', '-not', '-path', `${root}/labels/*`, '-delete'])
       await $.process.run(['find', root, '-mindepth', '1', '-type', 'd', '-empty', '-delete'])
     }
+    if (settings.instructions !== 'off') await loadFragments($)
     if (isOn) {
       await keyFor($)
       showStatus($)
@@ -333,16 +513,121 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
+  // E1, pinned fragments: one stable section at the end of the system prompt.
+  on('prompt.compose', async ($, e, next) => {
+    const composed = await next(e)
+    if (settings.instructions !== 'active') return composed
+    const text = pinnedSection((await loadFragments($)).list)
+    if (text === undefined) return composed
+
+    return { ...composed, sections: [...composed.sections, { id: 'jev-harness:pinned', text, scope: 'session' as const }] }
+  }).catch((_, e, next) => next(e))
+
+  // E1, conditional fragments: appended to the prompt that first meets their
+  // condition, once; judged again only after a compaction.
+  on('prompt.submit', async ($, e, next) => {
+    const mode = settings.instructions
+    // The person's own prompts only: typed, remote, headless, or a plugin's sent as the person's words.
+    const origin = e.origin
+    const isPersons =
+      origin !== undefined &&
+      (origin.kind === 'composer' || origin.kind === 'bridge' || origin.kind === 'sdk' || (origin.kind === 'plugin' && origin.asUser === true))
+    if (mode === 'off' || e.command !== undefined || e.isMeta || !isPersons) return next(e)
+    const t0 = await $.clock.now()
+    const { list } = await loadFragments($)
+    const sessionId = await $.session.id()
+    const storeKey = `${mode === 'active' ? 'attached' : 'would-attach'}:${sessionId}`
+    const done = await namesIn($, storeKey)
+    const candidates = list.filter(fragment => !fragment.pin && !done.has(fragment.name))
+    if (candidates.length === 0) return next(e)
+
+    const rule = new Map(candidates.map(fragment => [fragment.name, keywordHit(e.text, fragment.keywords)]))
+    const key = await keyFor($)
+    const sent = key === undefined ? null : { request: scrub(e.text, await homeOf($)).slice(0, 600) }
+    // Active asks Jev only where no keyword decided; shadow asks for every candidate, to compare.
+    const toAsk = mode === 'active' ? candidates.filter(fragment => rule.get(fragment.name) !== true) : candidates
+
+    const finish = async (asked: { result?: JevResult; probabilities: Map<string, number> }, hookMs: number) => {
+      const decisions = decideFragments(candidates, rule, asked.probabilities, settings.instructionThreshold)
+      const chosen = decisions.filter(d => d.attach).map(d => d.name)
+      if (chosen.length > 0) await $.store.set(storeKey, [...done, ...chosen])
+      runtime.counts.attached += chosen.length
+      await recordFragments($, { sessionId, joinKey: e.turnId, mode, t0, hookMs }, decisions, sent, asked.result)
+      showStatus($)
+
+      return chosen
+    }
+
+    if (mode === 'shadow') {
+      const result = await next(e)
+      const hookMs = (await $.clock.now()) - t0
+      void (async () => finish(key && sent ? await askConditions($, sessionId, key.key, sent, toAsk) : { probabilities: new Map() }, hookMs))().catch(() => undefined)
+
+      return result
+    }
+    const asked = key && sent ? await askConditions($, sessionId, key.key, sent, toAsk) : { probabilities: new Map<string, number>() }
+    const chosen = await finish(asked, (await $.clock.now()) - t0)
+    const blocks = list.filter(fragment => chosen.includes(fragment.name)).map(fragmentBlock)
+
+    return blocks.length === 0 ? next(e) : next({ ...e, context: [...(e.context ?? []), ...blocks] })
+  }).catch((_, e, next) => next(e))
+
+  // After a compaction the appended fragments are gone with the old turns:
+  // every fragment may be judged again.
+  on('classic.PostCompact', async ($, e, next) => {
+    const below = await next(e)
+    if (e.agent_id !== undefined) return below
+    if (settings.instructions !== 'off') await forgetFragments($)
+    // A plugin loaded before this one answered the compaction, so its transcript was never seen.
+    if (settings.foldJev !== 'off' && runtime.sawCompaction !== true) {
+      runtime.counts.foldMissed++
+      $.ui.log(`${$.plugin.name}: a compaction was answered before this plugin saw it; load jev-harness before plugins that compact (context-fold) to judge fold relevance`)
+      showStatus($)
+    }
+    runtime.sawCompaction = false
+
+    return below
+  }).catch((_, e, next) => next(e))
+  on('classic.SessionStart', async ($, e, next) => {
+    const below = await next(e)
+    if (settings.instructions !== 'off' && (e.source === 'compact' || e.source === 'clear')) await forgetFragments($)
+
+    return below
+  }).catch((_, e, next) => next(e))
+
+  // Fold relevance, shadow: the transcript as it stands before the compaction.
+  // classic.PreCompact runs only when the engine itself summarizes, so a
+  // compaction another plugin answers (context-fold) would go unseen there.
+  on('session.compact', async ($, e, next) => {
+    if (settings.foldJev !== 'off' && e.agentId === undefined && e.trigger !== 'precompute') {
+      runtime.sawCompaction = true
+      void judgeFold($, e.messages).catch(() => undefined)
+    }
+
+    return next(e)
+  }).catch((_, e, next) => next(e))
+
   on('command.run', { command: 'jev-report' }, async $ => {
     const { records, labels } = await readRecords($, 20_000)
     const key = await keyFor($)
     const trust = await trustFor($)
+    const fragments = settings.instructions === 'off' ? undefined : await loadFragments($)
     const header = [
-      `jev-harness: stop ${settings.stopGate}, tool ${settings.toolGate}, key ${key ? `from ${key.source}` : 'none'}, provider ${trust.trust} (${trust.why})`,
+      `jev-harness: stop ${settings.stopGate}, tool ${settings.toolGate}, tool jev ${settings.toolJev}, instructions ${settings.instructions}, fold ${settings.foldJev}`,
+      `key ${key ? `from ${key.source}` : 'none'}, provider ${trust.trust} (${trust.why})`,
+      ...(fragments
+        ? [`fragments: ${fragments.list.length} in ${fragments.dir} (#${fragments.hash.slice(0, 6)})${fragments.problems.length ? `; skipped: ${fragments.problems.join('; ')}` : ''}`]
+        : []),
       `${records.length} records, ${labels.size} labels`,
     ]
+    const reports = [
+      pointReport(STOP_POINT, records, labels, settings.stopThreshold),
+      pointReport(TOOL_POINT, records, labels, settings.toolThreshold),
+      pointReport(INSTRUCTIONS_POINT, records, labels, settings.instructionThreshold),
+      pointReport(FOLD_POINT, records, labels, 0.5),
+    ]
 
-    return { text: [...header, pointReport(STOP_POINT, records, labels, settings.stopThreshold), pointReport(TOOL_POINT, records, labels, 0.5)].join('\n\n') }
+    return { text: [...header, ...reports].join('\n\n') }
   })
 
   on('command.run', { command: 'jev-mark' }, async ($, e) => {
@@ -437,7 +722,7 @@ export const register: Register = (on, options) => {
     const home = await homeOf($)
     const cwd = await $.session.cwd()
     const candidates = [...new Set([...pathFieldValues(input), ...(command === undefined ? [] : pathCandidates(command))])].slice(0, 40)
-    const protectedRoots = [$.plugin.root, await logRootOf($)]
+    const protectedRoots = [$.plugin.root, await logRootOf($), ...(settings.instructions === 'off' ? [] : [await fragmentsDirOf($)])]
     const isWriting = canWrite(tool, command)
 
     let verdict: FloorVerdict | undefined

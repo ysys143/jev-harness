@@ -1,0 +1,6 @@
+{
+  "name": "jev-harness",
+  "description": "jev-harness: Jev judgment gates for Claude Code.",
+  "owner": { "name": "ysys143" },
+  "plugins": [{ "name": "jev-harness", "source": "./" }]
+}

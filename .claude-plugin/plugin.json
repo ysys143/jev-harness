@@ -1,0 +1,63 @@
+{
+  "name": "jev-harness",
+  "version": "0.0.1",
+  "description": "Jev judgment gates for Claude Code: catch turns that end by announcing work, and keep secret files away from non-Anthropic providers. Off by default; shadow first.",
+  "author": { "name": "ysys143", "url": "https://github.com/ysys143" },
+  "homepage": "https://github.com/ysys143/jev-harness",
+  "repository": "https://github.com/ysys143/jev-harness",
+  "license": "MIT",
+  "keywords": ["jev", "typesafe", "hooks", "mod", "guardrails"],
+  "userConfig": {
+    "stopGate": {
+      "type": "string",
+      "title": "Stop gate (announced-but-not-done turns)",
+      "description": "off: nothing. shadow: Jev judges each turn end and only records it; the last paragraph (scrubbed) is sent to TypeSafe. active: a judged announcement makes the model continue.",
+      "options": ["off", "shadow", "active"],
+      "default": "off"
+    },
+    "toolGate": {
+      "type": "string",
+      "title": "Tool gate (secret files, non-Anthropic providers)",
+      "description": "off: nothing. shadow: records tool calls that touch secret files or print secrets. active: refuses them when the session is served by a provider other than Anthropic, and refuses writes to this plugin's own files. Nothing is sent to TypeSafe.",
+      "options": ["off", "shadow", "active"],
+      "default": "off"
+    },
+    "stopThreshold": {
+      "type": "number",
+      "title": "Stop gate threshold",
+      "description": "Jev's probability of 'announce' at or above which a turn counts as announcing work.",
+      "default": 0.7
+    },
+    "timeoutMs": {
+      "type": "number",
+      "title": "Jev timeout (ms)",
+      "description": "A Jev call that takes longer is dropped and the gate does nothing.",
+      "default": 2000
+    },
+    "stopCap": {
+      "type": "number",
+      "title": "Stop gate calls per session",
+      "description": "Jev calls the stop gate may make in one session.",
+      "default": 200
+    },
+    "providerTrust": {
+      "type": "string",
+      "title": "Provider trust",
+      "description": "auto: decide from the session (first-party only with an Anthropic credential, no proxy, no custom CA, no Bedrock/Vertex/Foundry, and an anthropic.com endpoint). external: always treat the session as served by another provider.",
+      "options": ["auto", "external"],
+      "default": "auto"
+    },
+    "trustedProxies": {
+      "type": "string",
+      "title": "Trusted local proxies",
+      "description": "Comma-separated host:port of local proxies known to forward to Anthropic only (for example 127.0.0.1:9100).",
+      "default": ""
+    },
+    "apiKey": {
+      "type": "string",
+      "title": "TypeSafe API key",
+      "description": "Kept in secure storage. Without it, the plugin's .env (TYPESAFE_API_KEY=) or the TYPESAFE_API_KEY environment variable is used.",
+      "sensitive": true
+    }
+  }
+}

@@ -42,7 +42,7 @@ Then turn on the gates you want, in `/config` under jev-harness or in `settings.
 { "pluginConfigs": { "jev-harness@jev-harness": { "options": { "stopGate": "shadow", "toolGate": "shadow" } } } }
 ```
 
-The Stop gate needs a TypeSafe key, read from the first of: the plugin's `apiKey` setting (kept in secure storage), a `TYPESAFE_API_KEY=` line in a `.env` in the plugin's folder, or the `TYPESAFE_API_KEY` environment variable. Without one the status line says `jev: no key` and nothing is sent.
+The Stop gate needs a TypeSafe key, read from the first of: the plugin's `apiKey` setting (kept in secure storage; set it with `/plugin configure jev-harness@jev-harness`), a `TYPESAFE_API_KEY=` line in a `.env` in the plugin's folder, or the `TYPESAFE_API_KEY` environment variable. Without one the status line says `jev: no key` and nothing is sent.
 
 ## Records, labels and when to turn a gate on
 

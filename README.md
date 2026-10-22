@@ -1,5 +1,7 @@
 # jev-harness
 
+> **Moved to [context-harness](https://github.com/ysys143/context-harness)**, which joins context-fold and jev-harness in one mod. This repository is archived and no longer updated. To switch, uninstall jev-harness and install context-harness (`/plugin install context-harness --marketplace ysys143/context-harness`), then set your gates and key again under its name; records under `~/.local/state/jev-harness/` are not read there.
+
 Judgment gates for Claude Code, built on Jev, TypeSafe's decision model that answers a structured question about the current state with a typed, probability-scored answer. The gates sit beside the agent: deterministic rules first, Jev only where a rule cannot decide, and everything recorded before anything is enforced.
 
 **Everything is off by default.** Installing the plugin and having a key sends nothing anywhere.

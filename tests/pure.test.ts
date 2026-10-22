@@ -81,6 +81,9 @@ test('scrub removes secrets, addresses and the home folder', () => {
   expect(out).not.toContain('ghp_')
   expect(out).toContain('~/code')
   expect(out).toContain('DB_PASSWORD=<secret>')
+  // A long path is not a secret: seen scrubbed whole in a live run.
+  const path = '/private/tmp/claude-501/-Users-me-Documents-GitHub-some-project-e0b394b8-00ae-483d-ab66-4cf014489a1d/scratchpad/greet.py'
+  expect(scrub(`changed ${path}`, HOME)).toBe(`changed ${path}`)
 })
 
 test('the budget stops at the cap and opens the circuit after three failures in a row', () => {

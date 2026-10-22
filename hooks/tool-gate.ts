@@ -1,5 +1,6 @@
 // E2 floor: who serves this session, and which paths and commands a tool
 // call touches that must not reach a provider other than Anthropic.
+import type { JevQuestion } from './jev'
 
 export const TOOL_POINT = 'tool'
 
@@ -189,4 +190,67 @@ export function denyMessage(verdict: FloorVerdict, trust: Trust): string {
   if (verdict.kind === 'self') return `jev-harness: ${verdict.path ?? 'this path'} holds ${verdict.reason}; an agent may not change it.`
 
   return `jev-harness: this call touches ${verdict.reason}${verdict.path ? ` (${verdict.path})` : ''}, and this session is served by a provider other than Anthropic (${trust}). Do it from a first-party session instead.`
+}
+
+// Jev for tool calls (0.0.2): only in sessions served by another provider,
+// and only for calls the floor let through.
+
+// Measured with jev-1.14.0 on 22 generic targets: this question put 18 in the
+// expected class, and restricted + custom >= 0.8 separated the risky ones in
+// all 22 (docker-compose.yml sat at 0.70).
+export const TOOL_QUESTION: JevQuestion = {
+  type: 'choice',
+  instructions:
+    'A coding agent is about to use a tool on this target, in a session served by a third-party model provider. ' +
+    'Judging only by the path or command, which kind of data does the target most likely hold?',
+  criteria: {
+    open: 'Public material: documentation, licenses, open-source dependencies, generic build, test or CI files.',
+    standard: 'Ordinary application source code or project configuration without credentials.',
+    restricted: 'Secrets or credentials, environment or infrastructure configuration with secrets, production or personal data.',
+    custom: 'Proprietary or confidential material: unpublished research, customer or business data the owner would not share with an outside vendor.',
+  },
+}
+
+/** The probability that a target is restricted or custom. */
+export function riskOf(probabilities: Readonly<Record<string, number>> | undefined): number {
+  return (probabilities?.restricted ?? 0) + (probabilities?.custom ?? 0)
+}
+
+/** FNV-1a, 32 bits, as 8 hex digits: a stable stand-in for a name that should not leave. */
+export function shortHash(text: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i)
+    hash = Math.imul(hash, 0x01000193) >>> 0
+  }
+
+  return hash.toString(16).padStart(8, '0')
+}
+
+/**
+ * How a path is shown to Jev: inside the working folder as ./relative, so the
+ * project's own name stays home; elsewhere under home as ~/<hash>/ plus its
+ * last two parts; system paths as they are.
+ */
+export function targetOfPath(absolute: string, home: string, cwd: string): string {
+  const root = cwd.replace(/\/+$/, '')
+  if (absolute === root) return '.'
+  if (absolute.startsWith(`${root}/`)) return `./${absolute.slice(root.length + 1)}`
+  const h = home.replace(/\/+$/, '')
+  if (absolute.startsWith(`${h}/`)) {
+    const parts = absolute.slice(h.length + 1).split('/')
+    if (parts.length <= 2) return `~/${parts.join('/')}`
+
+    return `~/<${shortHash(parts.slice(0, -2).join('/'))}>/${parts.slice(-2).join('/')}`
+  }
+
+  return absolute
+}
+
+/** How a command is shown to Jev: the working folder as ., home as ~, at most 200 characters. */
+export function targetOfCommand(command: string, home: string, cwd: string): string {
+  const root = cwd.replace(/\/+$/, '')
+  const local = root.length > 1 ? command.split(`${root}/`).join('./').split(root).join('.') : command
+
+  return local.slice(0, 200)
 }

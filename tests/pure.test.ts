@@ -12,8 +12,12 @@ import {
   pathCandidates,
   pathFieldValues,
   restrictedReason,
+  riskOf,
   secretDumpReason,
   selfProtectReason,
+  shortHash,
+  targetOfCommand,
+  targetOfPath,
   type TrustFacts,
 } from '../hooks/tool-gate'
 
@@ -243,4 +247,25 @@ test('the report lists disagreements to label and the sweep once labels exist', 
   expect(text).toContain('both 1, rule only 0, jev only 1, neither 1')
   expect(text).toContain('/jev-mark <id> y|n): r2')
   expect(text).toContain('labels 1 (positive 1, negative 0)')
+})
+
+test('tool targets: the working folder becomes ./, other folders under home a hash, system paths stay', () => {
+  const cwd = `${HOME}/Documents/GitHub/client_project`
+  expect(targetOfPath(`${cwd}/src/app.py`, HOME, cwd)).toBe('./src/app.py')
+  expect(targetOfPath(cwd, HOME, cwd)).toBe('.')
+  const other = targetOfPath(`${HOME}/Documents/GitHub/other_client/config/db.yml`, HOME, cwd)
+  expect(other).toBe(`~/<${shortHash('Documents/GitHub/other_client')}>/config/db.yml`)
+  expect(other).not.toContain('other_client')
+  expect(targetOfPath(`${HOME}/notes.md`, HOME, cwd)).toBe('~/notes.md')
+  expect(targetOfPath('/etc/hosts', HOME, cwd)).toBe('/etc/hosts')
+  expect(targetOfCommand(`cat ${cwd}/config/settings.py && ls ${cwd}`, HOME, cwd)).toBe('cat ./config/settings.py && ls .')
+  expect(targetOfCommand('x'.repeat(300), HOME, cwd).length).toBe(200)
+})
+
+test('the hash is stable and the risk adds restricted and custom', () => {
+  expect(shortHash('Documents/GitHub/a')).toBe(shortHash('Documents/GitHub/a'))
+  expect(shortHash('a')).not.toBe(shortHash('b'))
+  expect(shortHash('a')).toMatch(/^[0-9a-f]{8}$/)
+  expect(riskOf({ open: 0.05, standard: 0.05, restricted: 0.6, custom: 0.3 }).toFixed(2)).toBe('0.90')
+  expect(riskOf(undefined)).toBe(0)
 })

@@ -1,4 +1,4 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { Args, EngineInterface, EventResult, Next, Register } from 'claude-code'
 import { admit, afterCall, readBudget } from './budget'
 import { JEV_ENDPOINT, parseResponse, probabilityOf, requestBody, type JevQuestion, type JevResult } from './jev'
 import { pickKey } from './key'
@@ -7,6 +7,7 @@ import { scrub } from './scrub'
 import { STOP_MESSAGE, STOP_POINT, STOP_QUESTION, announcesByRule, lastParagraph, stopSkipReason } from './stop-gate'
 import {
   TOOL_POINT,
+  TOOL_QUESTION,
   canWrite,
   decideTrust,
   denyMessage,
@@ -17,6 +18,9 @@ import {
   secretDumpReason,
   selfProtectReason,
   type FloorVerdict,
+  riskOf,
+  targetOfCommand,
+  targetOfPath,
   type Trust,
 } from './tool-gate'
 
@@ -32,6 +36,9 @@ type Settings = {
   stopThreshold: number
   timeoutMs: number
   stopCap: number
+  toolJev: Mode
+  toolThreshold: number
+  toolCap: number
   providerTrust: 'auto' | 'external'
   trustedProxies: string[]
   apiKey: unknown
@@ -42,10 +49,13 @@ const madeDirs = new Set<string>()
 let sequence = 0
 const runtime: {
   settings?: Settings
-  counts: { judged: number; failed: number; floor: number }
+  counts: { judged: number; failed: number; floor: number; toolJudged: number }
   key?: { key: string; source: string } | null
   trust?: { trust: Trust; why: string }
-} = { counts: { judged: 0, failed: 0, floor: 0 } }
+} = { counts: { judged: 0, failed: 0, floor: 0, toolJudged: 0 } }
+
+// Tool targets already judged in this process: one Jev call per target and session.
+const toolVerdicts = new Map<string, { risk: number; choice: string }>()
 
 const settingsOf = (): Settings => {
   if (runtime.settings === undefined) throw new Error('jev-harness: settings read before register')
@@ -178,6 +188,86 @@ const readRecords = async ($: EngineInterface, limit: number): Promise<{ records
   return { records, labels }
 }
 
+type ToolFacts = { tool: string; command?: string; candidates: readonly string[]; home: string; cwd: string; t0: number }
+
+/**
+ * Jev's judgment of a tool call the floor let through: only in an external
+ * session, with a path or command shown in place of the file's contents.
+ * Shadow runs the tool first and judges afterwards; active judges first.
+ */
+const judgeTool = async (
+  $: EngineInterface,
+  e: Args<'tool.call'>,
+  next: Next<'tool.call'>,
+  facts: ToolFacts,
+): Promise<EventResult<'tool.call'>> => {
+  const settings = settingsOf()
+  const mode = settings.toolJev
+  if (mode === 'off') return next(e)
+  const trust = await trustFor($)
+  if (trust.trust !== 'external') return next(e)
+  const key = await keyFor($)
+  const first = facts.candidates[0]
+  const shown =
+    facts.command !== undefined
+      ? targetOfCommand(facts.command, facts.home, facts.cwd)
+      : first === undefined
+        ? undefined
+        : targetOfPath(normalizePath(first, facts.home, facts.cwd), facts.home, facts.cwd)
+  if (key === undefined || shown === undefined) return next(e)
+
+  const sessionId = await $.session.id()
+  const sent = { tool: facts.tool, target: scrub(shown, facts.home) }
+  const cacheKey = `${sessionId}\n${sent.tool}\n${sent.target}`
+  const hookMs = (await $.clock.now()) - facts.t0
+  const base = { id: newId(facts.t0), ts: new Date(facts.t0).toISOString(), sessionId, joinKey: e.tool_use_id, point: TOOL_POINT, mode }
+
+  const verdictOf = async (): Promise<{ risk: number; choice: string } | undefined> => {
+    const known = toolVerdicts.get(cacheKey)
+    if (known !== undefined) return known
+    const result = await judge($, { sessionId, point: 'tool-jev', cap: settings.toolCap }, key.key, sent, { data: TOOL_QUESTION }, settings.timeoutMs)
+    const answer = result.ok ? result.answers.data : undefined
+    const verdict = answer === undefined ? undefined : { risk: riskOf(answer.probabilities), choice: String(answer.value) }
+    if (verdict !== undefined) {
+      toolVerdicts.set(cacheKey, verdict)
+      runtime.counts.toolJudged++
+    }
+    await writeRecord($, {
+      ...base,
+      heuristic: false,
+      sent,
+      jev: verdict?.risk,
+      usage: result.ok ? result.usage : undefined,
+      error: result.ok ? undefined : result.kind === 'http' ? `http ${result.status ?? 0}` : result.kind,
+      jevMs: result.ms,
+      // Active holds the call while Jev answers; shadow judges after it ran.
+      hookMs: mode === 'active' ? hookMs + result.ms : hookMs,
+      decision: verdict === undefined ? 'allow' : verdict.risk >= settings.toolThreshold ? (mode === 'active' ? 'deny' : 'would-deny') : 'allow',
+      facts: { tool: facts.tool, kind: 'jev', class: verdict?.choice ?? '-', trust: trust.trust, why: trust.why },
+    })
+    showStatus($)
+
+    return verdict
+  }
+
+  if (mode === 'shadow') {
+    const result = await next(e)
+    void verdictOf().catch(() => undefined)
+
+    return result
+  }
+  const verdict = await verdictOf()
+  if (verdict !== undefined && verdict.risk >= settings.toolThreshold) {
+    return {
+      deny:
+        `jev-harness: Jev judged ${sent.target} as ${verdict.choice} data (${verdict.risk.toFixed(2)}), and this session is ` +
+        `served by a provider other than Anthropic (${trust.why}). Do it from a first-party session instead.`,
+    }
+  }
+
+  return next(e)
+}
+
 const keyFor = async ($: EngineInterface): Promise<{ key: string; source: string } | undefined> => {
   if (runtime.key === undefined) runtime.key = (await resolveKey($, settingsOf().apiKey)) ?? null
 
@@ -194,11 +284,12 @@ const trustFor = async ($: EngineInterface): Promise<{ trust: Trust; why: string
 const showStatus = ($: EngineInterface): void => {
   const settings = settingsOf()
   const { counts } = runtime
-  if (settings.stopGate === 'off' && settings.toolGate === 'off') return
-  if (settings.stopGate !== 'off' && runtime.key === null) return $.ui.status('jev: no key')
+  if (settings.stopGate === 'off' && settings.toolGate === 'off' && settings.toolJev === 'off') return
+  if ((settings.stopGate !== 'off' || settings.toolJev !== 'off') && runtime.key === null) return $.ui.status('jev: no key')
   const parts = ['jev']
   if (settings.stopGate !== 'off') parts.push(`stop ${settings.stopGate} ${counts.judged} judged${counts.failed ? `, ${counts.failed} failed` : ''}`)
   if (settings.toolGate !== 'off') parts.push(`tool ${settings.toolGate} ${counts.floor} hits`)
+  if (settings.toolJev !== 'off') parts.push(`tool jev ${settings.toolJev} ${counts.toolJudged} judged`)
   $.ui.status(parts.join(' · '))
 }
 
@@ -209,6 +300,9 @@ export const register: Register = (on, options) => {
     stopThreshold: numberOf(options.stopThreshold, 0.7, 0, 1),
     timeoutMs: numberOf(options.timeoutMs, 2000, 200, 8000),
     stopCap: numberOf(options.stopCap, 200, 0, 10_000),
+    toolJev: modeOf(options.toolJev),
+    toolThreshold: numberOf(options.toolThreshold, 0.8, 0, 1),
+    toolCap: numberOf(options.toolCap, 300, 0, 10_000),
     providerTrust: options.providerTrust === 'external' ? 'external' : 'auto',
     trustedProxies:
       typeof options.trustedProxies === 'string'
@@ -219,7 +313,7 @@ export const register: Register = (on, options) => {
   runtime.settings = settings
   runtime.key = undefined
   runtime.trust = undefined
-  const isOn = settings.stopGate !== 'off' || settings.toolGate !== 'off'
+  const isOn = settings.stopGate !== 'off' || settings.toolGate !== 'off' || settings.toolJev !== 'off'
   const { counts } = runtime
 
   on('session.start', async ($, e, next) => {
@@ -329,11 +423,12 @@ export const register: Register = (on, options) => {
     return probability !== undefined && probability >= settings.stopThreshold ? { ...below, block: STOP_MESSAGE } : below
   }).catch((_, e, next) => next(e))
 
-  // E2 floor: restricted paths and secret-printing commands, refused only
-  // when the session is served by a provider other than Anthropic.
+  // E2: the floor (restricted paths and secret-printing commands, no Jev)
+  // and, for what it lets through in an external session, Jev's judgment.
   on('tool.call', async ($, e, next) => {
     const mode = settings.toolGate
-    if (mode === 'off') return next(e)
+    const jevMode = settings.toolJev
+    if (mode === 'off' && jevMode === 'off') return next(e)
 
     const t0 = await $.clock.now()
     const tool = String(e.tool)
@@ -366,7 +461,9 @@ export const register: Register = (on, options) => {
     }
     const dump = command === undefined ? undefined : secretDumpReason(command)
     if (verdict === undefined && dump !== undefined) verdict = { kind: 'secret-dump', reason: dump }
-    if (verdict === undefined) return next(e)
+    // A call the floor names never goes to Jev, whatever the floor's own mode.
+    if (verdict === undefined) return judgeTool($, e, next, { tool, command, candidates, home, cwd, t0 })
+    if (mode === 'off') return next(e)
 
     const trust = await trustFor($)
     const isRefused = verdict.kind === 'self' || trust.trust === 'external'

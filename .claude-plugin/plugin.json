@@ -1,25 +1,53 @@
 {
   "name": "jev-harness",
-  "version": "0.0.1",
-  "description": "Jev judgment gates for Claude Code: catch turns that end by announcing work, and keep secret files away from non-Anthropic providers. Off by default; shadow first.",
-  "author": { "name": "ysys143", "url": "https://github.com/ysys143" },
+  "version": "0.0.2",
+  "description": "Jev judgment gates for Claude Code: catch turns that end by announcing work, and keep secret or confidential files away from non-Anthropic providers. Off by default; shadow first.",
+  "author": {
+    "name": "ysys143",
+    "url": "https://github.com/ysys143"
+  },
   "homepage": "https://github.com/ysys143/jev-harness",
   "repository": "https://github.com/ysys143/jev-harness",
   "license": "MIT",
-  "keywords": ["jev", "typesafe", "hooks", "mod", "guardrails"],
+  "keywords": [
+    "jev",
+    "typesafe",
+    "hooks",
+    "mod",
+    "guardrails"
+  ],
   "userConfig": {
     "stopGate": {
       "type": "string",
       "title": "Stop gate (announced-but-not-done turns)",
       "description": "off: nothing. shadow: Jev judges each turn end and only records it; the last paragraph (scrubbed) is sent to TypeSafe. active: a judged announcement makes the model continue.",
-      "options": ["off", "shadow", "active"],
+      "options": [
+        "off",
+        "shadow",
+        "active"
+      ],
       "default": "off"
     },
     "toolGate": {
       "type": "string",
       "title": "Tool gate (secret files, non-Anthropic providers)",
       "description": "off: nothing. shadow: records tool calls that touch secret files or print secrets. active: refuses them when the session is served by a provider other than Anthropic, and refuses writes to this plugin's own files. Nothing is sent to TypeSafe.",
-      "options": ["off", "shadow", "active"],
+      "options": [
+        "off",
+        "shadow",
+        "active"
+      ],
+      "default": "off"
+    },
+    "toolJev": {
+      "type": "string",
+      "title": "Tool gate: Jev judgment (external sessions)",
+      "description": "off: nothing. shadow: in sessions served by a provider other than Anthropic, Jev classifies each call the floor let through (open, standard, restricted, custom) from its path or command and records it; the scrubbed path or the command's first 200 characters are sent to TypeSafe, never file contents. active: calls judged restricted or custom are refused.",
+      "options": [
+        "off",
+        "shadow",
+        "active"
+      ],
       "default": "off"
     },
     "stopThreshold": {
@@ -40,11 +68,26 @@
       "description": "Jev calls the stop gate may make in one session.",
       "default": 200
     },
+    "toolThreshold": {
+      "type": "number",
+      "title": "Tool gate threshold",
+      "description": "Jev's probability of restricted plus custom at or above which a call counts as sensitive.",
+      "default": 0.8
+    },
+    "toolCap": {
+      "type": "number",
+      "title": "Tool gate calls per session",
+      "description": "Jev calls the tool gate may make in one session; each target is asked once.",
+      "default": 300
+    },
     "providerTrust": {
       "type": "string",
       "title": "Provider trust",
       "description": "auto: decide from the session (first-party only with an Anthropic credential, no proxy, no custom CA, no Bedrock/Vertex/Foundry, and an anthropic.com endpoint). external: always treat the session as served by another provider.",
-      "options": ["auto", "external"],
+      "options": [
+        "auto",
+        "external"
+      ],
       "default": "auto"
     },
     "trustedProxies": {

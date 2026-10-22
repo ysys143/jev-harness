@@ -31,6 +31,15 @@ const ANNOUNCE = (p: number): HttpResponse => ({
   }),
 })
 
+const DATA = (choice: string, probabilities: Record<string, number>): HttpResponse => ({
+  status: 200,
+  ok: true,
+  headers: {},
+  text: JSON.stringify({ model: 'jev-1.14.0', answers: { data: { type: 'choice', choice, confidence: 0.9, probabilities } }, usage: { input_tokens: 300, output_tokens: 30 } }),
+})
+const RESTRICTED = DATA('restricted', { open: 0.01, standard: 0.04, restricted: 0.9, custom: 0.05 })
+const STANDARD = DATA('standard', { open: 0.1, standard: 0.85, restricted: 0.03, custom: 0.02 })
+
 const setup = (on: On, s: Setup = {}) => {
   const env: Record<string, string> = { HOME, ...s.env }
   const files: Record<string, string> = { ...s.files }
@@ -38,6 +47,7 @@ const setup = (on: On, s: Setup = {}) => {
   const writes: { path: string; text: string }[] = []
   const store = new Map<string, unknown>()
   const statuses: (string | undefined)[] = []
+  const order: string[] = []
   let now = 1_700_000_000_000
 
   on('env.get', (_, e) => ({ value: env[e.name] }))
@@ -66,6 +76,7 @@ const setup = (on: On, s: Setup = {}) => {
   on('http.fetch', async (_, e) => {
     const body = JSON.parse(e.init?.body ?? '{}') as Record<string, unknown>
     fetches.push({ headers: { ...e.init?.headers }, body })
+    order.push('jev')
     return { value: await (s.fetch ?? (() => ANNOUNCE(0.99)))(body) }
   })
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
@@ -84,9 +95,12 @@ const setup = (on: On, s: Setup = {}) => {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   // The settings hooks and the tool beneath the plugin.
   on('classic.Stop', () => s.stopBelow ?? {})
-  on('tool.call', () => ({ result: 'ok' }))
+  on('tool.call', () => {
+    order.push('tool')
+    return { result: 'ok' }
+  })
 
-  return { fetches, writes, store, statuses }
+  return { fetches, writes, store, statuses, order }
 }
 
 const records = (writes: readonly { path: string; text: string }[], point: string) =>
@@ -255,4 +269,58 @@ test('/jev-mark writes a label and /jev-report reads records and labels', { opti
   expect(report).toContain('1 records, 1 labels')
   expect(report).toContain('labels 1 (positive 1, negative 0)')
   expect((await $.command.run({ command: 'jev-mark', args: 'bad' } as never)).text).toContain('Usage')
+})
+
+const EXTERNAL_JEV = { toolJev: 'shadow', providerTrust: 'external' }
+
+test('tool jev, shadow: the tool runs first, then the path is judged and recorded', { options: EXTERNAL_JEV }, async ($, on) => {
+  const io = setup(on, { env: KEY_ENV, fetch: () => STANDARD })
+  expect((await $.tool.call({ tool: 'Read', file_path: '/proj/src/app.py' })).deny).toBe(undefined)
+  await settle(() => records(io.writes, 'tool').length > 0)
+  expect(io.order).toEqual(['tool', 'jev'])
+  expect(io.fetches[0]?.body.state).toEqual({ tool: 'Read', target: './src/app.py' })
+  const [record] = records(io.writes, 'tool')
+  expect(record?.decision).toBe('allow')
+  expect((record?.facts as Record<string, string>).class).toBe('standard')
+})
+
+test('tool jev sends nothing in a first-party session', { options: { toolJev: 'shadow' } }, async ($, on) => {
+  const io = setup(on, { env: KEY_ENV })
+  await $.tool.call({ tool: 'Read', file_path: '/proj/src/app.py' })
+  expect(io.fetches.length).toBe(0)
+})
+
+test('a path the floor names is never sent to Jev, even with the floor off', { options: EXTERNAL_JEV }, async ($, on) => {
+  const io = setup(on, { env: KEY_ENV })
+  expect((await $.tool.call({ tool: 'Read', file_path: '/proj/.env' })).deny).toBe(undefined)
+  expect(io.fetches.length).toBe(0)
+})
+
+test('tool jev, active: a restricted judgment refuses, a standard one passes', { options: { toolJev: 'active', providerTrust: 'external' } }, async ($, on) => {
+  let answer = RESTRICTED
+  setup(on, { env: KEY_ENV, fetch: () => answer })
+  const denied = (await $.tool.call({ tool: 'Read', file_path: '/proj/config/settings.yml' })).deny
+  expect(denied).toContain('./config/settings.yml as restricted data (0.95)')
+  answer = STANDARD
+  expect((await $.tool.call({ tool: 'Read', file_path: '/proj/src/app.py' })).deny).toBe(undefined)
+})
+
+test('tool jev asks once per target in a session', { options: { toolJev: 'active', providerTrust: 'external' } }, async ($, on) => {
+  const io = setup(on, { env: KEY_ENV, fetch: () => RESTRICTED })
+  await $.tool.call({ tool: 'Read', file_path: '/proj/infra/prod.tfvars' })
+  const second = await $.tool.call({ tool: 'Read', file_path: '/proj/infra/prod.tfvars' })
+  expect(second.deny).toContain('restricted')
+  expect(io.fetches.length).toBe(1)
+})
+
+test('tool jev, active: no answer in time lets the call through', { options: { toolJev: 'active', providerTrust: 'external' } }, async ($, on) => {
+  setup(on, { env: KEY_ENV, fetch: () => new Promise<HttpResponse>(() => undefined) })
+  expect((await $.tool.call({ tool: 'Read', file_path: '/proj/config/settings.yml' })).deny).toBe(undefined)
+})
+
+test('tool jev shows a command relative to the working folder', { options: EXTERNAL_JEV }, async ($, on) => {
+  const io = setup(on, { env: KEY_ENV, fetch: () => STANDARD })
+  await $.tool.call({ tool: 'Bash', command: 'cat /proj/config/app.toml' })
+  await settle(() => io.fetches.length > 0)
+  expect(io.fetches[0]?.body.state).toEqual({ tool: 'Bash', target: 'cat ./config/app.toml' })
 })
